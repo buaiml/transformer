@@ -49,8 +49,8 @@ class RotaryEmbedding(nn.Module):
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.einsum('i,j->ij', t, self.inv_freq)
             emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-            self.cos_cached = emb.cos()[:, None, None, :]
-            self.sin_cached = emb.sin()[:, None, None, :]
+            self.cos_cached = emb.cos()[None, None, :, :]  # Shape: (1, 1, seq_len, dim)
+            self.sin_cached = emb.sin()[None, None, :, :]  # Shape: (1, 1, seq_len, dim)
         return self.cos_cached, self.sin_cached
 
 
