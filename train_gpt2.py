@@ -415,13 +415,16 @@ def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_c
 
     print(f"Tokenizing {len(subset_view)} documents...")
     all_docs_tokens = [] # Store tokens for each document separately
-    eos_token_id = tokenizer.eos_token # Use tokenizer's EOS if available
-    if eos_token_id is None:
-        # Fallback if tokenizer doesn't have a specific EOS token (like cl100k_base might not)
-        # Using the ID mentioned in the original script (though its origin is unclear without tiktoken installed)
-        eos_token_id = 100259 # This might need adjustment based on the actual tokenizer
-        print(f"Warning: Tokenizer has no specific EOS token. Using fallback ID: {eos_token_id}")
-
+    if hasattr(tokenizer, 'eot_token'):
+        eos_token_id = tokenizer.eot_token
+        print(f"Using tokenizer's EOT token: {eos_token_id}")
+    elif hasattr(tokenizer, 'eos_token'):
+        eos_token_id = tokenizer.eos_token
+        print(f"Using tokenizer's EOS token: {eos_token_id}")
+    else:
+        # Fallback for tiktoken cl100k_base - typically uses 100257 as <|endoftext|>
+        eos_token_id = 100257  # cl100k_base <|endoftext|> token
+        print(f"Warning: Tokenizer has no specific EOS/EOT token. Using fallback ID: {eos_token_id}")
 
     max_token_value = -1 # Keep track for vocab size calculation
 
