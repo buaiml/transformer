@@ -474,6 +474,35 @@ def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_c
     return all_docs_tokens, vocab_size
 
 
+def get_lr_multiplier(step: int, warmup_steps: int, max_steps: int, initial_lr: float, min_lr: float) -> float:
+    """Calculates the learning rate multiplier based on warmup and cosine decay."""
+    if initial_lr <= 0:
+        return 0.0
+
+    min_lr_ratio = min_lr / initial_lr
+
+    if step < warmup_steps:
+        # Multiplier increases linearly from near 0 up to 1.0
+        # Handle warmup_steps=0 case to avoid division by zero
+        if warmup_steps == 0:
+            return 1.0
+        return float(step + 1) / float(warmup_steps) # step starts at 0
+
+    # Don't decay past min rate
+    if step >= max_steps:
+        return min_lr_ratio
+
+    # Cosine decay
+    decay_steps = max_steps - warmup_steps
+    if decay_steps <= 0:
+        return min_lr_ratio
+    progress = float(step - warmup_steps) / float(decay_steps)
+    progress = max(0.0, min(1.0, progress))
+    coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
+    multiplier = min_lr_ratio + coeff * (1.0 - min_lr_ratio)
+    return multiplier
+
+
 def train_model(model, train_loader, val_loader, args, device, tokenizer): # Added tokenizer for sampling
     """Train the model with progress tracking"""
     # Setup optimizer with separate weight decay for different parameter types
@@ -502,23 +531,13 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
     optimizer = torch.optim.AdamW(optim_groups, lr=args.lr, betas=(0.9, 0.95), **extra_args)
     if use_fused: print("Using fused AdamW.")
 
-
-    # Learning rate scheduler with warmup and cosine decay
-    def get_lr(step):
-        # 1) linear warmup for warmup_steps
-        if step < args.warmup_steps:
-            return args.lr * (step + 1) / args.warmup_steps
-        # 2) if step > total_steps, return min learning rate
-        total_steps = args.epochs * len(train_loader) # Approximate total steps
-        if step > total_steps:
-             return args.min_lr
-        # 3) in between, use cosine decay down to min learning rate
-        decay_ratio = (step - args.warmup_steps) / (total_steps - args.warmup_steps)
-        assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-        return args.min_lr + coeff * (args.lr - args.min_lr)
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=get_lr)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: get_lr_multiplier(
+        step=step,
+        warmup_steps=args.warmup_steps,
+        max_steps=args.max_steps,
+        initial_lr=args.lr,
+        min_lr=args.min_lr
+    ))
 
     # Setup mixed precision if requested
     use_amp = args.amp and torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast')
