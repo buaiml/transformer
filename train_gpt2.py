@@ -15,7 +15,7 @@ import numpy as np
 from tqdm import tqdm
 from datasets import load_dataset
 import tiktoken
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 
 @dataclass
@@ -474,8 +474,6 @@ def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_c
     return all_docs_tokens, vocab_size
 
 
-# train_model, evaluate, sample_text functions remain the same
-# ... (paste the unchanged functions here) ...
 def train_model(model, train_loader, val_loader, args, device, tokenizer): # Added tokenizer for sampling
     """Train the model with progress tracking"""
     # Setup optimizer with separate weight decay for different parameter types
@@ -727,34 +725,30 @@ def main():
     parser.add_argument("--n_embd", type=int, default=512, help="Embedding dimension")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout probability")
     parser.add_argument("--no_rope", action="store_true", help="Disable rotary positional embeddings")
-    parser.add_argument("--no_gradient_checkpointing", action="store_true", help="Disable gradient checkpointing (if implemented)") # Adjusted help text
+    parser.add_argument("--no_gradient_checkpointing", action="store_true", help="Disable gradient checkpointing (if implemented)")
 
     # Dataset parameters
-    # NEW argument to select the FineWeb subset
+    # TODO consider allowing other datasets? dataset mixing?
     parser.add_argument("--fineweb_subset", type=str, default="sample-10BT",
                         help="FineWeb subset to use (e.g., 'sample-10BT', 'sample-100BT', 'CC-MAIN-2023-50')")
-    parser.add_argument("--sample_size", type=int, default=1000, # Increased default for 10BT sample
+    parser.add_argument("--sample_size", type=int, default=1000,
                         help="Max documents to sample *from the chosen subset* for tokenization")
-    # REMOVED limit_files argument
-    # parser.add_argument("--limit_files", type=int, default=1, help="Limit the number of files to download")
-    parser.add_argument("--batch_size", type=int, default=8, help="Training batch size per device") # Clarified per device
-    parser.add_argument("--val_split", type=float, default=0.05, help="Validation set fraction (from loaded documents)") # Reduced default
+
+    parser.add_argument("--batch_size", type=int, default=8, help="Training batch size per device")
+    parser.add_argument("--val_split", type=float, default=0.05, help="Validation set fraction (from loaded documents)")
     parser.add_argument("--data_cache", type=str, default="data_cache", help="Directory to cache processed data")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of DataLoader worker processes (0 for main process)")
 
-
     # Training parameters
-    parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs") # Reduced default for testing
-    parser.add_argument("--lr", type=float, default=6e-4, help="Maximum learning rate") # Clarified maximum
-    parser.add_argument("--min_lr", type=float, default=6e-5, help="Minimum learning rate (after decay)") # Clarified minimum
+    parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=6e-4, help="Maximum learning rate")
+    parser.add_argument("--min_lr", type=float, default=6e-5, help="Minimum learning rate (after decay)")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping (max norm)") # Clarified max norm
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping (max norm)")
     parser.add_argument("--warmup_steps", type=int, default=100, help="Learning rate warmup steps")
     parser.add_argument("--val_interval", type=int, default=200, help="Validation interval (steps, 0 to disable)")
     parser.add_argument("--amp", action="store_true", help="Use Automatic Mixed Precision (AMP)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    # parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients over")
-
 
     # Output parameters
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save model checkpoints")
