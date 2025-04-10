@@ -585,6 +585,8 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
             if args.val_interval > 0 and (i + 1) % args.val_interval == 0:
                 val_loss = evaluate(model, val_loader, device)
                 print(f"\nStep {i + 1}, Val loss: {val_loss:.4f}, Perplexity: {math.exp(val_loss):.2f}")
+                generate_validation_samples(model, tokenizer, device, i+1, epoch)
+
                 if val_loss < best_val_loss:
                      best_val_loss = val_loss
                      print("New best validation loss.")
@@ -711,6 +713,35 @@ def sample_text(model, tokenizer, device, prompt="Once upon a time", max_tokens=
     print(f"{generated_text}")
     print("--- End of sample ---")
     return generated_text
+
+
+def generate_validation_samples(model, tokenizer, device, step, epoch):
+    """Generate multiple text samples after validation with different prompts"""
+    print(f"\n===== SAMPLE GENERATIONS AT EPOCH {epoch + 1}, STEP {step} =====")
+
+    prompts = [
+        "The future of artificial intelligence is",
+        "Once upon a time there was a",
+        "The key to successful machine learning is",
+        "In a world where robots",
+        "The most important scientific discovery was"
+    ]
+
+    for i, prompt in enumerate(prompts[:3]):  # Use first 3 prompts to keep output manageable
+        print(f"\nPrompt {i + 1}: \"{prompt}\"")
+        tokens = tokenizer.encode(prompt)
+        tokens_tensor = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+
+        with torch.no_grad():
+            model.eval()
+            generated_tokens = model.generate(tokens_tensor, max_new_tokens=30, temperature=0.8, top_k=40)
+            model.train()
+
+        generated_text = tokenizer.decode(generated_tokens[0].tolist())
+        print(f"Output: {generated_text}")
+
+    print("=" * 50)
+
 
 # Need inspect for checking AdamW args
 import inspect
