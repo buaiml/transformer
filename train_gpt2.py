@@ -543,7 +543,7 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
             x, y = x.to(device), y.to(device)
 
             # Forward pass under autocast if using AMP
-            with autocast(enabled=use_amp):
+            with autocast(device_type=device.type, enabled=use_amp):
                  logits, loss = model(x, y)
                  # loss = loss / args.gradient_accumulation_steps # Scale loss if accumulating gradients
 
@@ -679,7 +679,7 @@ def evaluate(model, val_loader, device):
     for x, y in pbar:
         x, y = x.to(device), y.to(device)
         # Use autocast for consistency, although grads aren't needed
-        with autocast(enabled=args.amp and torch.cuda.is_available()):
+        with autocast(device_type=device.type, enabled=args.amp and torch.cuda.is_available()):
              logits, loss = model(x, y)
 
         if loss is not None: # Ensure loss was calculated
