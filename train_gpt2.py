@@ -531,10 +531,11 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
     optimizer = torch.optim.AdamW(optim_groups, lr=args.lr, betas=(0.9, 0.95), **extra_args)
     if use_fused: print("Using fused AdamW.")
 
+    max_steps = args.epochs * len(train_loader)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: get_lr_multiplier(
         step=step,
         warmup_steps=args.warmup_steps,
-        max_steps=args.max_steps,
+        max_steps=max_steps,
         initial_lr=args.lr,
         min_lr=args.min_lr
     ))
