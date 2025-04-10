@@ -578,7 +578,7 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
             pbar.set_postfix({
                 'loss': f"{loss_item:.4f}",
                 'avg_loss': f"{epoch_loss / (i + 1):.4f}",
-                'lr': f"{curr_lr:.6f}"
+                'lr': f"{curr_lr:.2e}"
             })
 
             # Run validation periodically
