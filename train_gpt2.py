@@ -1,9 +1,11 @@
 import argparse
 import math
+import json
 import os
 import time
 import random
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
@@ -333,24 +335,74 @@ class TextDataset(Dataset):
         return x, y
 
 
-def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_cache_dir="data_cache"):
-    """Load and process a specified subset of the FineWeb dataset."""
-    cache_path = Path(data_cache_dir) / f"fineweb_{subset_name}_docs_{sample_size}.pt" # Cache based on subset and sample size
-    cache_path.parent.mkdir(exist_ok=True, parents=True)
+def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_cache_dir="data_cache", num_shards=64):
+    """
+    Load and process a specified subset of the FineWeb dataset with optimized parallel loading.
+    Uses data sharding and memory mapping for high performance on multi-core systems.
+    """
+    base_path = Path(data_cache_dir) / f"fineweb_{subset_name}_{sample_size}"
+    base_path.parent.mkdir(exist_ok=True, parents=True)
 
-    if cache_path.exists():
-        print(f"Loading FineWeb document tokens from cache: {cache_path}")
-        processed_data = torch.load(cache_path)
-        all_docs_tokens = processed_data['docs_tokens']
-        vocab_size = processed_data['vocab_size']
-        print(f"Loaded {len(all_docs_tokens)} documents from cache.")
-        return all_docs_tokens, vocab_size
+    # Path to metadata file containing document info and vocabulary size
+    metadata_path = base_path.with_suffix('.json')
 
+    # Check if the sharded data already exists
+    shard_paths = [base_path.with_suffix(f'.shard{i}.mmap') for i in range(num_shards)]
+    shards_exist = all(p.exists() for p in shard_paths) and metadata_path.exists()
+
+    if shards_exist:
+        # Fast path: Load sharded data in parallel using memory mapping
+        print(f"Loading sharded document data using {num_shards} parallel processes...")
+
+        # Load metadata first (fast)
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+
+        vocab_size = metadata['vocab_size']
+        num_documents = metadata['num_documents']
+
+        # Process shards in parallel
+        with tqdm(total=num_shards, desc="Loading data shards") as pbar:
+            def load_shard(shard_idx):
+                shard_info = metadata['shards'][shard_idx]
+                shard_docs = []
+
+                # Memory map the shard file (near-instant)
+                mmap_array = np.memmap(
+                    shard_paths[shard_idx],
+                    dtype=np.int32,
+                    mode='r',
+                    shape=(shard_info['total_tokens'],)
+                )
+
+                # Extract documents using the offsets
+                doc_offsets = shard_info['doc_offsets']
+                doc_lengths = shard_info['doc_lengths']
+
+                for i in range(len(doc_lengths)):
+                    start = doc_offsets[i]
+                    length = doc_lengths[i]
+                    # Convert each document's tokens to a Python list
+                    doc_tokens = mmap_array[start:start + length].tolist()
+                    shard_docs.append(doc_tokens)
+
+                pbar.update(1)
+                return shard_docs
+
+            # Use ProcessPoolExecutor to load shards in parallel
+            all_docs_tokens = []
+            with ProcessPoolExecutor(max_workers=min(num_shards, 64)) as executor:
+                for shard_docs in executor.map(load_shard, range(num_shards)):
+                    all_docs_tokens.extend(shard_docs)
+
+            print(
+                f"Successfully loaded {len(all_docs_tokens)} documents with {sum(len(doc) for doc in all_docs_tokens):,} total tokens.")
+            return all_docs_tokens, vocab_size
+
+    # No cache exists - we need to process the raw dataset
     print(f"Loading FineWeb subset '{subset_name}'...")
-    # Load the specified subset directly using the 'name' argument
-    # Use streaming=True for large datasets, False might be ok for small samples like 10BT
-    # Let's try without streaming first for simplicity with samples
     try:
+        from datasets import load_dataset
         dataset = load_dataset("HuggingFaceFW/fineweb", name=subset_name, split="train")
         print(f"Subset '{subset_name}' loaded with {len(dataset)} documents.")
     except Exception as e:
@@ -358,83 +410,146 @@ def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_c
         print("Please ensure the subset name is correct (e.g., 'sample-10BT', 'sample-100BT', 'CC-MAIN-2023-50').")
         raise
 
-    # Take the requested number of samples *from the loaded subset*
+    # Take the requested number of samples
     actual_samples = min(sample_size, len(dataset))
     if actual_samples < sample_size:
         print(f"Warning: Requested sample_size {sample_size} is larger than the loaded subset size {len(dataset)}. "
               f"Using all {len(dataset)} documents from the subset.")
 
     if actual_samples < len(dataset):
-        # Sample only if needed (if sample_size is less than the total docs in the subset)
+        # Sample only if needed
         print(f"Randomly sampling {actual_samples} documents from the subset...")
+        import random
         indices = random.sample(range(len(dataset)), actual_samples)
-        # Using select is generally efficient for datasets library
         subset_view = dataset.select(indices)
         print(f"Selected {len(subset_view)} random documents for processing.")
     else:
-        # Use the whole loaded dataset if sample_size >= len(dataset) or if they are equal
         subset_view = dataset
         print(f"Using all {len(subset_view)} documents from the loaded subset for processing.")
 
+    # Tokenize and process the data
     print(f"Tokenizing {len(subset_view)} documents...")
-    all_docs_tokens = [] # Store tokens for each document separately
+    all_docs_tokens = []
+
+    # Determine EOS token ID for the tokenizer
     if hasattr(tokenizer, 'eot_token'):
         eos_token_id = tokenizer.eot_token
-        print(f"Using tokenizer's EOT token: {eos_token_id}")
     elif hasattr(tokenizer, 'eos_token'):
         eos_token_id = tokenizer.eos_token
-        print(f"Using tokenizer's EOS token: {eos_token_id}")
     else:
-        # Fallback for tiktoken cl100k_base - typically uses 100257 as <|endoftext|>
         eos_token_id = 100257  # cl100k_base <|endoftext|> token
-        print(f"Warning: Tokenizer has no specific EOS/EOT token. Using fallback ID: {eos_token_id}")
 
-    max_token_value = -1 # Keep track for vocab size calculation
+    max_token_value = -1
 
-    # Use multiprocessing for tokenization if beneficial (depends on dataset size and CPU cores)
-    # For smaller samples, a single process might be faster due to overhead
-    # Let's stick to a simple loop for now
+    # Process documents
     for doc in tqdm(subset_view):
         try:
             text = doc["text"]
-            # Skip empty texts
             if not text or text.isspace():
                 continue
 
-            # Encode the document text
             doc_tokens = tokenizer.encode(text)
 
-            if doc_tokens: # Only add if tokens were produced
-                 all_docs_tokens.append(doc_tokens) # Keep docs separate
-                 # Update max token value encountered
-                 max_in_doc = max(doc_tokens)
-                 if max_in_doc > max_token_value:
-                     max_token_value = max_in_doc
+            if doc_tokens:
+                all_docs_tokens.append(doc_tokens)
+                max_in_doc = max(doc_tokens)
+                if max_in_doc > max_token_value:
+                    max_token_value = max_in_doc
 
         except Exception as e:
-            print(f"Error processing document (ID: {doc.get('id', 'N/A')}): {e}") # Attempt to get ID for error reporting
+            print(f"Error processing document (ID: {doc.get('id', 'N/A')}): {e}")
 
-    # Determine vocab_size based on tokenizer or max observed token
-    # It's generally safer to use the tokenizer's declared size
+    # Determine vocab_size
     vocab_size = tokenizer.n_vocab
-    print(f"Tokenizer's declared vocabulary size: {vocab_size}")
     if max_token_value >= vocab_size:
-        print(f"Warning: Max token ID found ({max_token_value}) is >= declared vocab size ({vocab_size}). Adjusting vocab_size.")
+        print(
+            f"Warning: Max token ID found ({max_token_value}) is >= declared vocab size ({vocab_size}). Adjusting vocab_size.")
         vocab_size = max_token_value + 1
-    elif max_token_value != -1:
-         print(f"Highest token ID found in data: {max_token_value}")
-
 
     total_tokens = sum(len(doc) for doc in all_docs_tokens)
     print(f"Created dataset with {len(all_docs_tokens)} documents and {total_tokens:,} total tokens.")
-    print(f"Final vocabulary size being used: {vocab_size}")
 
-    # Save to cache (save list of lists)
-    processed_data = {'docs_tokens': all_docs_tokens, 'vocab_size': vocab_size}
-    print(f"Saving processed documents to cache: {cache_path}")
-    torch.save(processed_data, cache_path)
+    # Save in the optimized format for future use
+    print(f"Saving processed documents in optimized sharded format...")
+    save_sharded_data(all_docs_tokens, vocab_size, base_path, num_shards)
 
     return all_docs_tokens, vocab_size
+
+
+def save_sharded_data(all_docs_tokens, vocab_size, base_path, num_shards):
+    """
+    Save data in multiple memory-mapped shards for parallel loading.
+    Also saves metadata for efficient reconstruction.
+    """
+    # Prepare document distribution across shards
+    num_docs = len(all_docs_tokens)
+    docs_per_shard = math.ceil(num_docs / num_shards)
+
+    # Prepare metadata structure
+    metadata = {
+        'vocab_size': vocab_size,
+        'num_documents': num_docs,
+        'num_shards': num_shards,
+        'shards': []
+    }
+
+    # Process each shard
+    for shard_idx in tqdm(range(num_shards), desc="Creating data shards"):
+        # Determine which documents go in this shard
+        start_doc = shard_idx * docs_per_shard
+        end_doc = min((shard_idx + 1) * docs_per_shard, num_docs)
+        shard_docs = all_docs_tokens[start_doc:end_doc]
+
+        if not shard_docs:  # Skip empty shards
+            metadata['shards'].append({
+                'total_tokens': 0,
+                'doc_offsets': [],
+                'doc_lengths': []
+            })
+            continue
+
+        # Calculate total tokens and prepare arrays
+        doc_lengths = [len(doc) for doc in shard_docs]
+        total_tokens = sum(doc_lengths)
+
+        # Create memory-mapped array for this shard
+        shard_path = base_path.with_suffix(f'.shard{shard_idx}.mmap')
+        mmap_array = np.memmap(
+            shard_path,
+            dtype=np.int32,
+            mode='w+',
+            shape=(total_tokens,)
+        )
+
+        # Populate memory-mapped array and record offsets
+        doc_offsets = []
+        current_offset = 0
+
+        for i, doc in enumerate(shard_docs):
+            doc_offsets.append(current_offset)
+            # Convert to numpy array for efficient copying
+            doc_array = np.array(doc, dtype=np.int32)
+            mmap_array[current_offset:current_offset + len(doc)] = doc_array
+            current_offset += len(doc)
+
+        # Flush changes to disk
+        mmap_array.flush()
+        del mmap_array  # Close the memory-mapped file
+
+        # Store shard metadata
+        metadata['shards'].append({
+            'total_tokens': total_tokens,
+            'doc_offsets': doc_offsets,
+            'doc_lengths': doc_lengths
+        })
+
+    # Save metadata
+    metadata_path = base_path.with_suffix('.json')
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f)
+
+    print(f"Successfully saved {num_docs} documents across {num_shards} shards.")
+    print(f"Metadata saved to {metadata_path}")
 
 
 def get_lr_multiplier(step: int, warmup_steps: int, max_steps: int, initial_lr: float, min_lr: float) -> float:
