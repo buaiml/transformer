@@ -16,6 +16,8 @@ from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.backends.cuda import flash_sdp_enabled
+from torch.nn.attention import SDPBackend
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from tqdm import tqdm
@@ -124,7 +126,7 @@ class MultiHeadAttention(nn.Module):
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if self.use_flash_attention:
-            with torch.nn.attention.sdpa_kernel(flash=True, math=False, mem_efficient=False):
+            with torch.nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 y = F.scaled_dot_product_attention(
                     q, k, v,
                     attn_mask=None,  # let flash handle causal masking
