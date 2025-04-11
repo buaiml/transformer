@@ -1,4 +1,5 @@
 import argparse
+import gc
 import math
 import json
 import os
@@ -606,10 +607,8 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
             # Avoid decay on bias, LayerNorm/RMSNorm weights
             if pn.endswith(".bias") or ("norm.weight" in pn):
                 nodecay_params.append(p)
-                # print(f"No decay for: {pn}")
             else:
                 decay_params.append(p)
-                # print(f"Decay for: {pn}")
 
     optim_groups = [
         {'params': decay_params, 'weight_decay': args.weight_decay},
@@ -638,16 +637,24 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
     if use_amp: print("Using Automatic Mixed Precision (AMP).")
     else: print("AMP not available or not enabled.")
 
+    def clear_memory():
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "reset_peak_memory_stats"):
+                torch.cuda.reset_peak_memory_stats()
 
     # Training loop
     best_val_loss = float('inf')
     tokens_processed = 0
     start_time = time.time()
+    clear_memory()
 
     for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0.0
-        optimizer.zero_grad() # Reset gradients once at the beginning of epoch or accumulation cycle
+        optimizer.zero_grad(set_to_none=True)
+        clear_memory()
 
         pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch + 1}/{args.epochs}")
 
@@ -657,17 +664,13 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
             # Forward pass under autocast if using AMP
             with autocast(device_type=device.type, enabled=use_amp):
                  logits, loss = model(x, y)
-                 # loss = loss / args.gradient_accumulation_steps # Scale loss if accumulating gradients
 
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
 
-            # # Gradient accumulation (optional)
-            # if (i + 1) % args.gradient_accumulation_steps == 0:
-
             # Gradient clipping
             if args.grad_clip > 0:
-                scaler.unscale_(optimizer) # Unscale gradients before clipping
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             # Optimizer step with scaler
@@ -675,16 +678,17 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
             scaler.update()
 
             # Reset gradients for the next iteration
-            optimizer.zero_grad(set_to_none=True) # More efficient
+            optimizer.zero_grad(set_to_none=True)
 
             # Update learning rate
             scheduler.step() # Update LR based on the current step
 
             # Update metrics
-            loss_item = loss.item() # * args.gradient_accumulation_steps # Unscale loss if accumulating
+            loss_item = loss.item()
             epoch_loss += loss_item
             tokens_processed += x.numel()
             curr_lr = scheduler.get_last_lr()[0]
+            del x, y, logits, loss
 
             # Update progress bar
             pbar.set_postfix({
@@ -695,6 +699,7 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
 
             # Run validation periodically
             if args.val_interval > 0 and (i + 1) % args.val_interval == 0:
+                clear_memory()
                 val_loss = evaluate(model, val_loader, device)
                 print(f"\nStep {i + 1}, Val loss: {val_loss:.4f}, Perplexity: {math.exp(val_loss):.2f}")
                 if val_loss < best_val_loss:
@@ -740,7 +745,6 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             print("New best validation loss at end of epoch.")
-            # Optional: Save best model checkpoint here as well
             if args.save_dir:
                  save_path = Path(args.save_dir) / f"model_best_val.pt"
                  save_path.parent.mkdir(exist_ok=True, parents=True)
@@ -793,15 +797,13 @@ def evaluate(model, val_loader, device):
     pbar = tqdm(val_loader, desc="Evaluating", leave=False)
     for x, y in pbar:
         x, y = x.to(device), y.to(device)
-        # Use autocast for consistency, although grads aren't needed
-        with autocast(device_type=device.type, enabled=args.amp and torch.cuda.is_available()):
+        with autocast(device_type=device.type, enabled=args.amp):
              logits, loss = model(x, y)
 
-        if loss is not None: # Ensure loss was calculated
+        if loss is not None:
              total_loss += loss.item()
              total_batches += 1
         pbar.set_postfix({'avg_loss': f"{total_loss / total_batches:.4f}"})
-
 
     model.train() # Set back to train mode
     if total_batches == 0: return float('inf') # Handle empty loader case
@@ -885,9 +887,13 @@ def main():
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"Using CUDA: {torch.cuda.get_device_name(0)}")
-        # Enable TF32 for faster matmuls on Ampere+ GPUs if desired
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        if torch.cuda.get_device_capability()[0] >= 9:
+            print("Ampere or newer GPU detected... enabling Hopper")
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.cuda.set_per_process_memory_fraction(0.92)
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
         print("Using Apple MPS (Metal)")
@@ -895,8 +901,6 @@ def main():
         device = torch.device("cpu")
         print("Using CPU")
 
-    # Initialize tokenizer - using cl100k_base
-    # Ensure tiktoken is installed: pip install tiktoken
     try:
         global tokenizer # Make accessible in train/sample functions
         tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -926,7 +930,6 @@ def main():
     # Approximate total tokens again after processing
     total_tokens_in_memory = sum(len(doc) for doc in all_docs_tokens)
     print(f"Total tokens in memory: {total_tokens_in_memory:,}")
-    print(f"Approximate size in memory: {total_tokens_in_memory * 2 / (1024 ** 2):.2f} MB (assuming int16/token)") # Rough estimate
 
     # Create train/val split from the list of document tokens
     random.shuffle(all_docs_tokens) # Shuffle documents before splitting
@@ -951,14 +954,18 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         pin_memory=(device.type == 'cuda'), # Pin memory only if using CUDA
-        num_workers=num_workers
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else 0,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         pin_memory=(device.type == 'cuda'),
-        num_workers=num_workers
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else 0,
     )
 
     print(f"Train sequences: {len(train_dataset)}, Train batches: {len(train_loader)}")
@@ -968,25 +975,23 @@ def main():
     # --- Model Initialization ---
     config = GPTConfig(
         block_size=args.block_size,
-        vocab_size=vocab_size, # Use the actual vocab size determined from data/tokenizer
+        vocab_size=vocab_size,
         n_layer=args.n_layer,
         n_head=args.n_head,
         n_embd=args.n_embd,
         dropout=args.dropout,
         use_rope=not args.no_rope,
-        gradient_checkpointing = False # Disabled for simplicity with Pre-LN changes
+        gradient_checkpointing = False,
     )
 
     model = GPT(config)
     model.to(device)
     print("-" * 30)
 
-
     # --- Training ---
     print("\nStarting training...")
     model = train_model(model, train_loader, val_loader, args, device, tokenizer) # Pass tokenizer
     print("-" * 30)
-
 
     # --- Final Sampling ---
     print("\nGenerating final samples...")
