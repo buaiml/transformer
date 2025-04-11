@@ -124,7 +124,7 @@ class MultiHeadAttention(nn.Module):
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if self.use_flash_attention:
-            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False) if torch.cuda.is_available() else nullcontext():
+            with torch.nn.attention.sdpa_kernel(flash=True, math=False, mem_efficient=False):
                 y = F.scaled_dot_product_attention(
                     q, k, v,
                     attn_mask=None,  # let flash handle causal masking
