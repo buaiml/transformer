@@ -6,6 +6,7 @@ import time
 import random
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
@@ -335,6 +336,36 @@ class TextDataset(Dataset):
         return x, y
 
 
+def load_shard(shard_idx, shard_paths, metadata, pbar=None):
+    shard_info = metadata['shards'][shard_idx]
+    shard_docs = []
+
+    # Memory map the shard file (near-instant)
+    mmap_array = np.memmap(
+        shard_paths[shard_idx],
+        dtype=np.int32,
+        mode='r',
+        shape=(shard_info['total_tokens'],)
+    )
+
+    # Extract documents using the offsets
+    doc_offsets = shard_info['doc_offsets']
+    doc_lengths = shard_info['doc_lengths']
+
+    for i in range(len(doc_lengths)):
+        start = doc_offsets[i]
+        length = doc_lengths[i]
+        # Convert each document's tokens to a Python list
+        doc_tokens = mmap_array[start:start + length].tolist()
+        shard_docs.append(doc_tokens)
+
+    # Update progress bar if provided
+    if pbar is not None:
+        pbar.update(1)
+
+    return shard_docs
+
+
 def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_cache_dir="data_cache", num_shards=64):
     """
     Load and process a specified subset of the FineWeb dataset with optimized parallel loading.
@@ -363,31 +394,12 @@ def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_c
 
         # Process shards in parallel
         with tqdm(total=num_shards, desc="Loading data shards") as pbar:
-            def load_shard(shard_idx):
-                shard_info = metadata['shards'][shard_idx]
-                shard_docs = []
-
-                # Memory map the shard file (near-instant)
-                mmap_array = np.memmap(
-                    shard_paths[shard_idx],
-                    dtype=np.int32,
-                    mode='r',
-                    shape=(shard_info['total_tokens'],)
-                )
-
-                # Extract documents using the offsets
-                doc_offsets = shard_info['doc_offsets']
-                doc_lengths = shard_info['doc_lengths']
-
-                for i in range(len(doc_lengths)):
-                    start = doc_offsets[i]
-                    length = doc_lengths[i]
-                    # Convert each document's tokens to a Python list
-                    doc_tokens = mmap_array[start:start + length].tolist()
-                    shard_docs.append(doc_tokens)
-
-                pbar.update(1)
-                return shard_docs
+            load_shard_with_args = partial(
+                load_shard,
+                shard_paths=shard_paths,
+                metadata=metadata,
+                pbar=pbar
+            )
 
             # Use ProcessPoolExecutor to load shards in parallel
             all_docs_tokens = []
