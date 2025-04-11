@@ -300,76 +300,39 @@ class GPT(nn.Module):
 
 class TextDataset(Dataset):
     def __init__(self, tokens_list, block_size):
-        self.tokens_list = tokens_list # Expecting a list of token lists (one per document)
+        self.tokens_list = tokens_list
         self.block_size = block_size
-        self.total_length = sum(len(tokens) for tokens in tokens_list)
 
-        # Precompute cumulative lengths for faster lookup
-        self.cumulative_lengths = [0] * len(tokens_list)
-        current_len = 0
-        for i, tokens in enumerate(tokens_list):
-            current_len += len(tokens)
-            self.cumulative_lengths[i] = current_len
+        # Precompute all valid (doc_idx, start_pos) pairs
+        self.valid_indices = []
+        for doc_idx, tokens in enumerate(tokens_list):
+            # For each document, find all valid starting positions
+            doc_len = len(tokens)
+            if doc_len >= block_size + 1:  # Need at least block_size+1 tokens
+                valid_starts = doc_len - block_size
+                for start_pos in range(valid_starts):
+                    self.valid_indices.append((doc_idx, start_pos))
 
-        # Calculate total number of possible starting positions
-        self.num_sequences = sum(max(0, len(tokens) - block_size) for tokens in tokens_list)
-        print(f"TextDataset created with {len(tokens_list)} documents, {self.total_length} tokens, and {self.num_sequences} possible sequences of length {block_size+1}.")
-
+        print(f"TextDataset created with {len(tokens_list)} documents and {len(self.valid_indices)} valid sequences.")
 
     def __len__(self):
-        # The length is the number of valid starting points for sequences
-        # across all documents, ensuring we have block_size + 1 tokens.
-        # This might slightly overestimate if docs are shorter than block_size+1
-        # A more accurate but potentially slower approach would precompute all valid indices.
-        # Let's stick to a simpler calculation for now.
-        # return max(0, self.total_length - self.block_size) # Old way (single concatenated sequence)
-        return self.num_sequences
-
-
-    def _find_doc_and_offset(self, global_idx):
-        # Find which document the global_idx falls into
-        doc_idx = -1
-        start_idx_in_doc = -1
-
-        current_start = 0
-        for i, tokens in enumerate(self.tokens_list):
-            doc_len = len(tokens)
-            num_starts_in_doc = max(0, doc_len - self.block_size)
-            if global_idx < current_start + num_starts_in_doc:
-                doc_idx = i
-                start_idx_in_doc = global_idx - current_start
-                break
-            current_start += num_starts_in_doc
-
-        if doc_idx == -1:
-            raise IndexError(f"Global index {global_idx} out of bounds for {self.num_sequences} sequences.")
-
-        return doc_idx, start_idx_in_doc
-
+        return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        if idx < 0 or idx >= self.num_sequences:
-             raise IndexError(f"Index {idx} out of range for {self.num_sequences} sequences.")
+        # Direct lookup instead of search
+        doc_idx, start_pos = self.valid_indices[idx]
 
-        # Find the document and the starting position within that document
-        doc_idx, start_idx_in_doc = self._find_doc_and_offset(idx)
-
-        # Get the specific document's tokens
+        # Get document tokens
         doc_tokens = self.tokens_list[doc_idx]
 
-        # Extract the sequence
-        # Ensure we don't go past the end of the document tokens
-        end_idx_x = start_idx_in_doc + self.block_size
-        end_idx_y = end_idx_x + 1
-
-        # Slice the tokens for x and y
-        x = torch.tensor(doc_tokens[start_idx_in_doc : end_idx_x], dtype=torch.long)
-        y = torch.tensor(doc_tokens[start_idx_in_doc + 1 : end_idx_y], dtype=torch.long)
+        # Extract sequence and target
+        end_pos = start_pos + self.block_size
+        x = torch.tensor(doc_tokens[start_pos:end_pos], dtype=torch.long)
+        y = torch.tensor(doc_tokens[start_pos + 1:end_pos + 1], dtype=torch.long)
 
         return x, y
 
 
-# MODIFIED FUNCTION
 def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_cache_dir="data_cache"):
     """Load and process a specified subset of the FineWeb dataset."""
     cache_path = Path(data_cache_dir) / f"fineweb_{subset_name}_docs_{sample_size}.pt" # Cache based on subset and sample size
@@ -622,6 +585,9 @@ def train_model(model, train_loader, val_loader, args, device, tokenizer): # Add
                              'val_loss': best_val_loss,
                          }, save_path)
                          print(f"Best model saved to {save_path}")
+
+                if args.sample_during_training:
+                    sample_text(model, tokenizer, device, prompt="The future of AI is", max_tokens=50)
 
                 model.train()  # Back to training mode
 
