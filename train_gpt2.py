@@ -5,9 +5,7 @@ import json
 import os
 import time
 import random
-from contextlib import nullcontext
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from dataclasses import dataclass
@@ -16,7 +14,6 @@ from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.backends.cuda import flash_sdp_enabled
 from torch.nn.attention import SDPBackend
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
@@ -108,6 +105,8 @@ class MultiHeadAttention(nn.Module):
 
         self.rotary_emb = RotaryEmbedding(self.head_size, max_seq_len=config.block_size) if config.use_rope else None
         self.use_flash_attention = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        if self.use_flash_attention:
+            print("Using flash attention")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()
