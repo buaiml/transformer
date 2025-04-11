@@ -4,6 +4,7 @@ import json
 import os
 import time
 import random
+from contextlib import nullcontext
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
@@ -35,27 +36,38 @@ class GPTConfig:
 
 
 class RotaryEmbedding(nn.Module):
-    """Rotary positional embeddings (RoPE)"""
+    """Rotary positional embeddings (RoPE) implementation"""
 
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim, max_seq_len=None, base=10000):
         super().__init__()
         self.dim = dim
         self.base = base
+        self.max_seq_len = max_seq_len
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
-        self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
 
+    def _compute_cos_sin(self, device):
+        if self.max_seq_len is None:
+            return
+
+        t = torch.arange(self.max_seq_len, device=device).type_as(self.inv_freq)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1).to(device)
+        self.register_buffer('cos_cached', emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer('sin_cached', emb.sin()[None, None, :, :], persistent=False)
+
     def forward(self, x, seq_len=None):
-        if seq_len != self.seq_len_cached:
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.einsum('i,j->ij', t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-            self.cos_cached = emb.cos()[None, None, :, :]  # Shape: (1, 1, seq_len, dim)
-            self.sin_cached = emb.sin()[None, None, :, :]  # Shape: (1, 1, seq_len, dim)
-        return self.cos_cached, self.sin_cached
+        if self.cos_cached is None or self.sin_cached is None:
+            self._compute_cos_sin(x.device)
+        if seq_len is None:
+            seq_len = x.shape[-2]  # shape is [batch, heads, seq_len, head_dim]
+        assert seq_len <= self.max_seq_len, f"Sequence length {seq_len} exceeds maximum length {self.max_seq_len}"
+        return (
+            self.cos_cached[:, :, :seq_len, ...],
+            self.sin_cached[:, :, :seq_len, ...]
+        )
 
 
 def rotate_half(x):
@@ -83,21 +95,17 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
         # Causal mask
-        # Adjusted to handle potential dynamic sequence lengths up to block_size
-        # This buffer will be sliced in the forward pass
-        self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
-                             .view(1, 1, config.block_size, config.block_size), persistent=False) # persistent=False avoids saving it in state_dict
+        mask = torch.tril(torch.ones(config.block_size, config.block_size))
+        self.register_buffer("mask", mask.view(1, 1, config.block_size, config.block_size), persistent=False)
 
-        # Rotary embeddings if enabled
-        self.rotary_emb = RotaryEmbedding(self.head_size) if config.use_rope else None
+        self.rotary_emb = RotaryEmbedding(self.head_size, max_seq_len=config.block_size) if config.use_rope else None
+        self.use_flash_attention = hasattr(torch.nn.functional, "scaled_dot_product_attention")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()
         assert T <= self.config.block_size, f"Sequence length {T} exceeds block size {self.config.block_size}"
-
-        # Project to query, key, value
         qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.config.n_embd, dim=2)
+        q, k, v = qkv.chunk(3, dim=2)
 
         # Reshape to (B, n_head, T, head_size)
         q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
@@ -109,23 +117,26 @@ class MultiHeadAttention(nn.Module):
             cos, sin = self.rotary_emb(q, seq_len=T)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Standard scaled dot-product attention
-        # Use flash attention if available for efficiency and memory saving
-        if hasattr(torch.nn.functional, 'scaled_dot_product_attention') and not self.config.use_rope: # Flash Attention doesn't easily support RoPE modification *within* the function yet
-             # Use causal=True for automatic masking
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout.p if self.training else 0., is_causal=True)
+        if self.use_flash_attention:
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False) if torch.cuda.is_available() else nullcontext():
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,  # let flash handle causal masking
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=True,
+                )
         else:
-            # Manual implementation if flash attention isn't available or RoPE is used
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            # Apply causal mask - slice the precomputed mask
-            att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+            # fallback to slower, default impl
+            scale = 1.0 / math.sqrt(self.head_size)
+            att = torch.matmul(q, k.transpose(-2, -1)) * scale
+            mask = self.mask[:, :, :T, :T]
+            att = att.masked_fill(mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = torch.matmul(att, v)
+            del att
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # Re-assemble all head outputs side by side
-
-        # Final projection
         y = self.c_proj(y)
         y = self.dropout(y)
         return y
@@ -161,11 +172,9 @@ class Block(nn.Module):
         self.gradient_checkpointing = config.gradient_checkpointing
 
     def _attn_forward(self, x):
-        # Ensure the layer norm is part of the checkpointed segment
         return self.attn(self.ln_1(x))
 
     def _mlp_forward(self, x):
-         # Ensure the layer norm is part of the checkpointed segment
         return self.mlp(self.ln_2(x))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -193,13 +202,8 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # Tie weights between token embeddings and final linear layer
         self.transformer.token_embeddings.weight = self.lm_head.weight
-
-        # Initialize weights
         self.apply(self._init_weights)
-
-        # Report number of parameters
         print(f"Model parameters: {self.get_num_params()/1e6:.2f}M")
 
 
@@ -413,7 +417,6 @@ def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_c
     # No cache exists - we need to process the raw dataset
     print(f"Loading FineWeb subset '{subset_name}'...")
     try:
-        from datasets import load_dataset
         dataset = load_dataset("HuggingFaceFW/fineweb", name=subset_name, split="train")
         print(f"Subset '{subset_name}' loaded with {len(dataset)} documents.")
     except Exception as e:
