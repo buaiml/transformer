@@ -6,6 +6,7 @@ import time
 import random
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
@@ -401,14 +402,12 @@ def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_c
                 pbar=pbar
             )
 
-            # Use ProcessPoolExecutor to load shards in parallel
             all_docs_tokens = []
-            with ProcessPoolExecutor(max_workers=min(num_shards, 64)) as executor:
+            with ThreadPoolExecutor(max_workers=min(num_shards, 64)) as executor:
                 for shard_docs in executor.map(load_shard_with_args, range(num_shards)):
                     all_docs_tokens.extend(shard_docs)
 
-            print(
-                f"Successfully loaded {len(all_docs_tokens)} documents with {sum(len(doc) for doc in all_docs_tokens):,} total tokens.")
+            print(f"Successfully loaded {len(all_docs_tokens)} documents with {sum(len(doc) for doc in all_docs_tokens):,} total tokens.")
             return all_docs_tokens, vocab_size
 
     # No cache exists - we need to process the raw dataset
