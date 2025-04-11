@@ -66,7 +66,7 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, x, seq_len=None):
         if not self._cache_initialized or self.cos_cached.device != x.device:
-            self._initialize_cache(x.device)
+            self._compute_cos_sin(x.device)
         if seq_len is None:
             seq_len = x.shape[-2]  # shape is [batch, heads, seq_len, head_dim]
         assert seq_len <= self.max_seq_len, f"Sequence length {seq_len} exceeds maximum length {self.max_seq_len}"
