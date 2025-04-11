@@ -404,7 +404,7 @@ def load_fineweb_dataset(subset_name, sample_size, tokenizer, block_size, data_c
             # Use ProcessPoolExecutor to load shards in parallel
             all_docs_tokens = []
             with ProcessPoolExecutor(max_workers=min(num_shards, 64)) as executor:
-                for shard_docs in executor.map(load_shard, range(num_shards)):
+                for shard_docs in executor.map(load_shard_with_args, range(num_shards)):
                     all_docs_tokens.extend(shard_docs)
 
             print(
