@@ -45,23 +45,28 @@ class RotaryEmbedding(nn.Module):
         self.base = base
         self.max_seq_len = max_seq_len
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
-        self.cos_cached = None
-        self.sin_cached = None
+        self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer('cos_cached', torch.empty(0), persistent=False)
+        self.register_buffer('sin_cached', torch.empty(0), persistent=False)
+        self._cache_initialized = False
 
     def _compute_cos_sin(self, device):
-        if self.max_seq_len is None:
+        if self._cache_initialized:
             return
 
         t = torch.arange(self.max_seq_len, device=device).type_as(self.inv_freq)
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1).to(device)
-        self.register_buffer('cos_cached', emb.cos()[None, None, :, :], persistent=False)
-        self.register_buffer('sin_cached', emb.sin()[None, None, :, :], persistent=False)
+
+        cos = emb.cos()[None, None, :, :]  # Shape: (1, 1, seq_len, dim)
+        sin = emb.sin()[None, None, :, :]  # Shape: (1, 1, seq_len, dim)
+        self.cos_cached = cos
+        self.sin_cached = sin
+        self._cache_initialized = True
 
     def forward(self, x, seq_len=None):
-        if self.cos_cached is None or self.sin_cached is None:
-            self._compute_cos_sin(x.device)
+        if not self._cache_initialized or self.cos_cached.device != x.device:
+            self._initialize_cache(x.device)
         if seq_len is None:
             seq_len = x.shape[-2]  # shape is [batch, heads, seq_len, head_dim]
         assert seq_len <= self.max_seq_len, f"Sequence length {seq_len} exceeds maximum length {self.max_seq_len}"
